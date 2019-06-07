@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: 'Any internal facing load balancers requires requests to come from inside a VPC as their DNS is not
+  available publicly. The use of AWS PrivateLink allows for this load balancers to be provided a reachable ENI that can
+  be used by other public facing services like the API Gateway but it can only be used with NLBs.
+  This template creates a NLB and an ALB in a private subnet that are connected to each other so any requests coming
+  through the NLB are automatically delivered to the ALB.
+  As NLB target groups can only be associated with EC2 instances or static IPs, it also creates a Lambda that updates
+  regularly the NLB target group with the ALB IPs. This Lambda is triggered regularly based on configuration by a
+  CloudWatch Event. It finds the IPs behind the ALB DNS name by issuing a DNS lookup, retrieves the currently registered
+  IPs in the target group and then registers the new ones and deregisters the ones no longer in use.'
+Parameters:
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs as targets for the load balancer.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the VPC where the load balancers are to be deployed
+  ResourcesPrefix:
+    Type: String
+    Description: Prefix to add to the name of the resources created by this template (Max 12 caracters).
+    Default: 'cf'
+    MaxLength: 12
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+        - Label:
+            default: VPC configuration.
+          Parameters:
+            - VpcId
+            - SubnetIds
+        - Label:
+            default: Naming
+          Parameters:
+            - ResourcesPrefix
+    ParameterLabels:
+      VpcId:
+        default: VPC ID.
+      SubnetIds:
+        default: Subnet IDs.
+      ResourcesPrefix:
+        default: Resources prefix.
+Resources:
+  BridgedPrivateNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Description: 'Private NLB used to forward requests from the NLB to registered targets'
+    Properties:
+      Name: !Sub '${ResourcesPrefix}-PrivateNlb'
+      Type: network
+      Scheme: internal
+      Subnets: !Ref SubnetIds
+  BridgedPrivateNlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ResourcesPrefix}-PrivateNlbTg'
+      TargetType: ip
+      Port: 80
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      HealthCheckIntervalSeconds: 10
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60
+  BridgedPrivateNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: BridgedPrivateNlb
+    Description: Listener to proxy calls to the ALB in the private subnet
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BridgedPrivateNlbTargetGroup
+      LoadBalancerArn: !Ref BridgedPrivateNlb
+      Port: 80
+      Protocol: TCP
+
+  LambdaDescribeNiRole:
+    Type: AWS::IAM::Role
+    Description: Role to allow lambdas to update the security group ingress rules
+    Properties:
+      RoleName: !Sub '${ResourcesPrefix}-LambdaDescribeNiRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  LambdaDescribeNiPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: LambdaDescribeNiRole
+    Description: Policy to allow Lambda to modify security group ingress rules and describe network interfaces.
+    Properties:
+      PolicyName: !Sub '${ResourcesPrefix}-LambdaDescribeNiPolicy'
+      Roles:
+        - !Ref LambdaDescribeNiRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Action:
+            - ec2:DescribeNetworkInterfaces
+            - logs:*
+          Resource: '*'
+
+  NlbPrivateIpsFinder:
+    Type: AWS::Serverless::Function
+    Description: Lambda used to find the NLB private IPs
+    Properties:
+      FunctionName: !Sub '${ResourcesPrefix}-NlbPrivateIpsFinder'
+      Handler: nlb_private_ips_finder.lambda_handler
+      Runtime: python3.7
+      CodeUri: ./nlb_private_ips_finder/nlb_private_ips_finder.zip #Project needs to be zipped every time it is modified
+      Role: !GetAtt [ LambdaDescribeNiRole, Arn ]
+      AutoPublishAlias: PROD
+
+  NlbPrivateIps:
+    Type: Custom::PrivateIps
+    Version: 1.0
+    DependsOn: NlbPrivateIpsFinder
+    Properties:
+      ServiceToken: !GetAtt [ NlbPrivateIpsFinder, Arn ]
+      nlbDescription: !GetAtt [ BridgedPrivateNlb, LoadBalancerName ]
+      listenerPort: 80
+
+  BridgedPrivateAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Description: Security group for the ALB
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcesPrefix}-PrivateAlbSg'
+      GroupName: !Sub '${ResourcesPrefix}-PrivateNlbToAlbSg'
+      GroupDescription: Security Group to handle ingress traffic into the ALB
+      SecurityGroupIngress: !GetAtt [ NlbPrivateIps, privateIps ]
+  BridgedPrivateAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Description: 'Private ALB used to forward requests from the NLB to registered targets'
+    Properties:
+      Name: !Sub '${ResourcesPrefix}-PrivateAlb'
+      Type: application
+      Scheme: internal
+      SecurityGroups:
+        - !GetAtt [ BridgedPrivateAlbSecurityGroup, GroupId ]
+      Subnets: !Ref SubnetIds
+  BridgedPrivateAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: BridgedPrivateAlb
+    Description: Listener to forward calls from the NLB to any configured target
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: 404
+      LoadBalancerArn: !Ref BridgedPrivateAlb
+      Port: 80
+      Protocol: HTTP
+
+  LambdaNlbTargetGroupUpdaterRole:
+    Type: AWS::IAM::Role
+    Description: Role to allow lambdas to update
+    Properties:
+      RoleName: !Sub '${ResourcesPrefix}-LambdaTgUpdater'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  LambdaNlbTargetGroupUpdaterPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: LambdaNlbTargetGroupUpdaterRole
+    Description: Policy to allow Lambda to modify security group ingress rules and describe network interfaces.
+    Properties:
+      Roles:
+        - !Ref LambdaNlbTargetGroupUpdaterRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeNetworkInterfaces
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:DeregisterTargets
+              - logs:*
+            Resource: '*'
+      PolicyName: !Sub '${ResourcesPrefix}-TgUpdaterPolicy'
+
+  NlbTargetGroupUpdater:
+    Type: AWS::Serverless::Function
+    Description: Lambda used to update the NLB target group IPs with the latest IPs from the ALB.
+    Properties:
+      FunctionName: !Sub '${ResourcesPrefix}-NlbTgUpdater'
+      Handler: nlb_target_group_updater.lambda_handler
+      Runtime: python3.7
+      CodeUri: ./nlb_target_group_updater/nlb_target_group_updater.py
+      Role: !GetAtt [ LambdaNlbTargetGroupUpdaterRole, Arn ]
+      AutoPublishAlias: PROD
+      Environment:
+        Variables:
+          targetPort: 80
+          nlbTargetGroupArn: !Ref BridgedPrivateNlbTargetGroup
+          albDescription: !GetAtt [ BridgedPrivateAlb, LoadBalancerName ]
+
+  NlbTargetGroupUpdaterTrigger:
+    Type: AWS::Events::Rule
+    Description: Single event to trigger the lambda that updates the NLB target group with the current ALB IPs
+    Properties:
+      Name: !Sub '${ResourcesPrefix}-NlbTgUpdaterTriggerEvent'
+      Description: Single event to trigger the lambda that updates the NLB target group with the current ALB IPs
+      ScheduleExpression: rate(1 minute)
+      Targets:
+        - Arn: !GetAtt [ NlbTargetGroupUpdater, Arn ]
+          Id: nlbTargetGroupUpdaterTriggerId
+          Input: !Sub
+            '{
+                "targetPort":"80",
+                "nlbTargetGroupArn":"${BridgedPrivateNlbTargetGroup}",
+                "albDescription":"${BridgedPrivateAlb.LoadBalancerName}"
+            }'
+
+  NlbTargetGroupUpdaterTriggerPolicy:
+    Type: AWS::Lambda::Permission
+    Description: Policy to allow the CloudWatch Event rule to trigger the lambda
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt [ NlbTargetGroupUpdater, Arn]
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt [ NlbTargetGroupUpdaterTrigger, Arn ]
+
+Outputs:
+  NlbPrivateDns:
+    Description: NLB private DNS endpoint.
+    Value: !Join
+      - ''
+      - - 'http://'
+        - !GetAtt [ BridgedPrivateNlb, DNSName]
+    Export:
+      Name: !Sub '${ResourcesPrefix}-BridgedPrivateNlbDNS'
+  NlbPrivateArn:
+    Description: NLB Arn.
+    Value: !Ref BridgedPrivateNlb
+    Export:
+      Name: !Sub '${ResourcesPrefix}-BridgedPrivateNlbARN'
+  AlbPrivateArn:
+    Description: ALB Arn.
+    Value: !Ref BridgedPrivateAlb
+    Export:
+      Name: !Sub '${ResourcesPrefix}-BridgedPrivateAlbARN'
+  AlbSecurityGroup:
+    Description: Security Group used by the ALB.
+    Value: !GetAtt [ BridgedPrivateAlbSecurityGroup, GroupId ]
+    Export:
+      Name: !Sub '${ResourcesPrefix}-BridgedPrivateAlbSG'
+  VpcId:
+    Description: VPC used to deploy the stack
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${ResourcesPrefix}-VpcId'
