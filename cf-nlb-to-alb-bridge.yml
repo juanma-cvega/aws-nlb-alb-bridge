@@ -137,6 +137,7 @@ Resources:
       GroupName: !Sub '${ResourcesPrefix}-PrivateNlbToAlbSg'
       GroupDescription: Security Group to handle ingress traffic into the ALB
       SecurityGroupIngress: !GetAtt [ NlbPrivateIps, privateIps ]
+      VpcId: !Ref VpcId
   BridgedPrivateAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Description: 'Private ALB used to forward requests from the NLB to registered targets'
